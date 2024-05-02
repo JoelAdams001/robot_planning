@@ -94,6 +94,7 @@ ament_python_install_package(${PROJECT_NAME})
 install(PROGRAMS
   scripts/surface_scanner.py
   scripts/zigzag.py
+  scripts/bayesian_scanner.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
