@@ -3,6 +3,7 @@
 import struct
 import numpy as np
 import rclpy
+import time
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2, PointField
@@ -27,28 +28,31 @@ from spot_msgs.action import RobotCommand  # type: ignore
 class BayesianScanner(Node):
     def __init__(self):
         super().__init__("bayesian_scanning")
-        self.declare_parameter('box_length', "2.5")
-        self.declare_parameter('box_width', "2.5")
+        self.declare_parameter('box_length', 2.5)
+        self.declare_parameter('box_width', 2.5)
         self.declare_parameter('frame_id', "map")
+
+        self.frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
+        self.l = self.get_parameter('box_length').get_parameter_value().double_value
+        self.w = self.get_parameter('box_width').get_parameter_value().double_value
 
         self.box_pub_ = self.create_publisher(PolygonStamped, 'bounding_box', 10)
         self.ground_truth_pub_ = self.create_publisher(PointCloud2, 'ground_truth', 10)
         self.box_timer_ = self.create_timer(0.5, self.bounding_box)
         self.ground_truth_timer_ = self.create_timer(0.5, self.ground_truth)
         self.samples_pub_ = self.create_publisher(PointCloud2, 'sampled_points', 10)
+        self.gp_pub_ = self.create_publisher(PointCloud2, 'radiation_map', 10)
+        self.ground_truth()
         self.scan()
 
     def bounding_box(self):
-        frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
-        l = self.get_parameter('box_length').get_parameter_value().double_value
-        w = self.get_parameter('box_width').get_parameter_value().double_value
         bounding_box = PolygonStamped()
-        bounding_box.header = Header(stamp=self.get_clock().now().to_msg(), frame_id=frame_id)
+        bounding_box.header = Header(stamp=self.get_clock().now().to_msg(), frame_id=self.frame_id)
         points = [
-        Point32(x=0.3, y=-w, z=0.0),
-        Point32(x=0.3 + l, y=-w, z=0.0),
-        Point32(x=0.3 + l, y=w, z=0.0),
-        Point32(x=0.3, y=w, z=0.0)
+        Point32(x=0.3, y=-self.w, z=0.0),
+        Point32(x=0.3 + self.l, y=-self.w, z=0.0),
+        Point32(x=0.3 + self.l, y=self.w, z=0.0),
+        Point32(x=0.3, y=self.w, z=0.0)
         ]
 
         bounding_box.polygon.points = points
@@ -59,19 +63,18 @@ class BayesianScanner(Node):
                 np.exp(-(x[0] - 4)**2 - (x[1] - 4)**2))
     
     def ground_truth(self):
-        frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
         # Plot the ground truth function
-        x = np.linspace(0, 2.5, 300)
-        y = np.linspace(0, 2.5, 300)
+        x = np.linspace(0, self.l, 300)
+        y = np.linspace(0, self.w, 300)
         X, Y = np.meshgrid(x, y)
         Z = np.array([self.function([xx, yy]) for xx, yy in zip(np.ravel(X), np.ravel(Y))])
         Z = Z.reshape(X.shape)
         tuples = np.dstack((X, Y, Z)).reshape(-1,3)
         
-        pc2 = self.create_pointcloud(tuples, frame_id)
+        pc2 = self.create_pointcloud(tuples, self.frame_id)
         self.ground_truth_pub_.publish(pc2)
 
-    def create_pointcloud(tuples, frame_id):
+    def create_pointcloud(self, tuples, frame_id):
         #Construct a ROS2 PointCloud2 message using a numpy array of tuples
         buf = []
         for pt in tuples:
@@ -109,7 +112,7 @@ class BayesianScanner(Node):
             return norm.cdf(Z)
 
     def select_next(self, acquisition, gp, bounds, y_max, n_restarts=25):
-        dim = gp.kernel_.n_dims
+        dim = 2
         min_val = 1
         min_x = None
 
@@ -117,8 +120,11 @@ class BayesianScanner(Node):
             """Minimization objective is the negative acquisition function"""
             return -acquisition(X.reshape(-1, dim), gp=gp, y_max=y_max)
         
+        mins = [b[0] for b in bounds]  # Minimum values for each dimension
+        maxs = [b[1] for b in bounds]  # Maximum values for each dimension
+        
         # Find the best optimum by starting from n_restart different random points.
-        for x0 in np.random.uniform(bounds[:, 0], bounds[:, 1], size=(n_restarts, dim)):
+        for x0 in np.random.uniform(mins, maxs, size=(n_restarts, dim)):
             res = minimize(min_obj, x0=x0, bounds=bounds, method='L-BFGS-B')
             if res.fun < min_val:
                 min_val = res.fun
@@ -128,10 +134,6 @@ class BayesianScanner(Node):
 
 
     def scan(self):
-        frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
-        l = self.get_parameter('box_length').get_parameter_value().double_value
-        w = self.get_parameter('box_width').get_parameter_value().double_value
-
         # Create Gaussian Process Surrogate
         kernel = C(1.0, (1e-4, 1e1)) * RBF([1.0, 1.0], (1e-4, 1e1))
         gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=10)
@@ -139,13 +141,13 @@ class BayesianScanner(Node):
         #Sample first point
         #Note here x_sample refers to the array of coords (x,y), y_sample is array of rad readings
         X_sample = np.array([[0.3, 0.3]])
-        rad_reading = self.function(X_sample)
+        rad_reading = self.function(X_sample[0])
         y_sample = np.array([[rad_reading]])
         gp.fit(X_sample, y_sample)
         y_max = rad_reading
 
         for _ in range(10):
-            x_next = self.select_next(self.probability_of_improvement, gp, [(-w, w) , (-l,l)], y_max)
+            x_next = self.select_next(self.probability_of_improvement, gp, [(0, self.w) , (0,self.l)], y_max)
             y_next = self.function(x_next)
             if y_next > y_max:
                y_max = y_next
@@ -154,8 +156,24 @@ class BayesianScanner(Node):
             gp.fit(X_sample, y_sample)
 
             tuples = [(x[0], x[1], y) for x, y in zip(X_sample, y_sample)]
-            pc2 = self.create_pointcloud(tuples, frame_id)
+            pc2 = self.create_pointcloud(tuples, self.frame_id)
             self.samples_pub_.publish(pc2)
+
+            #Publish current surrogate model
+            x = np.linspace(0, self.l, 300)
+            y = np.linspace(0, self.w, 300)
+            X, Y = np.meshgrid(x, y)
+            X_flat = X.ravel()
+            Y_flat = Y.ravel()
+            XY = np.vstack([X_flat, Y_flat]).T
+            Z_pred, Z_std = gp.predict(XY, return_std=True)
+            Z_pred = Z_pred.reshape(X.shape)
+            Z_std = Z_std.reshape(X.shape)
+            tuples = np.dstack((X, Y, Z_pred)).reshape(-1,3)
+            pc2 = self.create_pointcloud(tuples, self.frame_id)
+            self.gp_pub_.publish(pc2)
+            time.sleep(5)
+
 
         # frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
 
