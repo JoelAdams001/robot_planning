@@ -8,7 +8,7 @@ from rclpy.qos import qos_profile_sensor_data
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
-from geometry_msgs.msg import PolygonStamped, Pose, Point32, Quaternion
+from geometry_msgs.msg import PolygonStamped, Pose, Point, Point32, Quaternion
 
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
@@ -30,7 +30,7 @@ class BayesianScanner(Node):
         super().__init__("bayesian_scanning")
         self.declare_parameter('box_length', 2.5)
         self.declare_parameter('box_width', 2.5)
-        self.declare_parameter('frame_id', "map")
+        self.declare_parameter('frame_id', "odom")
 
         self.frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
         self.l = self.get_parameter('box_length').get_parameter_value().double_value
@@ -64,8 +64,8 @@ class BayesianScanner(Node):
     
     def ground_truth(self):
         # Plot the ground truth function
-        x = np.linspace(0, self.l, 300)
-        y = np.linspace(0, self.w, 300)
+        x = np.linspace(0, self.l, 100)
+        y = np.linspace(0, self.w, 100)
         X, Y = np.meshgrid(x, y)
         Z = np.array([self.function([xx, yy]) for xx, yy in zip(np.ravel(X), np.ravel(Y))])
         Z = Z.reshape(X.shape)
@@ -147,6 +147,11 @@ class BayesianScanner(Node):
         y_max = rad_reading
 
         for _ in range(10):
+            tf_listener = TFListenerWrapper(
+            "bo_scanner_tf", wait_for_transform=[ODOM_FRAME_NAME, "odom"]
+            )
+            hand_T_grav_body = tf_listener.lookup_a_tform_b(ODOM_FRAME_NAME, "odom")
+
             x_next = self.select_next(self.probability_of_improvement, gp, [(0, self.w) , (0,self.l)], y_max)
             y_next = self.function(x_next)
             if y_next > y_max:
@@ -160,8 +165,8 @@ class BayesianScanner(Node):
             self.samples_pub_.publish(pc2)
 
             #Publish current surrogate model
-            x = np.linspace(0, self.l, 300)
-            y = np.linspace(0, self.w, 300)
+            x = np.linspace(0, self.l, 100)
+            y = np.linspace(0, self.w, 100)
             X, Y = np.meshgrid(x, y)
             X_flat = X.ravel()
             Y_flat = Y.ravel()
@@ -172,90 +177,73 @@ class BayesianScanner(Node):
             tuples = np.dstack((X, Y, Z_pred)).reshape(-1,3)
             pc2 = self.create_pointcloud(tuples, self.frame_id)
             self.gp_pub_.publish(pc2)
-            time.sleep(5)
 
+            
 
-        # frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
+            robot = SimpleSpotCommander()
+            robot_command_client = ActionClientWrapper(RobotCommand, "robot_command", "surface_scanner_action_node")
 
-        # tf_listener = TFListenerWrapper(
-        # "zigzag_scanner_tf", wait_for_transform=[ODOM_FRAME_NAME, "body"]
-        # )
-        # hand_T_grav_body = tf_listener.lookup_a_tform_b(ODOM_FRAME_NAME, "body")
+            #Claim robot
+            self.get_logger().info("Claiming robot")
+            result = robot.command("claim")
+            if not result.success:
+                self.get_logger().error("Unable to claim robot message was " + result.message)
+                return False
+            self.get_logger().info("Claimed robot")
 
-        # robot = SimpleSpotCommander()
-        # robot_command_client = ActionClientWrapper(RobotCommand, "robot_command", "surface_scanner_action_node")
+            # Make the arm pose RobotCommand
+            # Build a position to move the arm to (in meters, relative to and expressed in the gravity aligned body frame).
+            pose = Pose()
+            pose.position = Point(x = x_next[0], y = x_next[1], z = 0.1)
+            pose.orientation = Quaternion(x = 0.0 , y = 0.707 , z = 0.0 , w = 0.707)
+            x, y, z = pose.position.x, pose.position.y, pose.position.z
+            hand_pos = geometry_pb2.Vec3(x=x, y=y, z=z)
 
-        # #Claim robot
-        # self.get_logger().info("Claiming robot")
-        # result = robot.command("claim")
-        # if not result.success:
-        #     self.get_logger().error("Unable to claim robot message was " + result.message)
-        #     return False
-        # self.get_logger().info("Claimed robot")
+            # Rotation as a quaternion
+            qw = pose.orientation.w
+            qx = pose.orientation.x
+            qy = pose.orientation.y
+            qz = pose.orientation.z
+            hand_Q = geometry_pb2.Quaternion(w=qw, x=qx, y=qy, z=qz)
 
-        # points = ZigzagScanner.create_array(0.8, 2, 0.35)
-        # p_array = PoseArray()
-        # p_array.header.frame_id = frame_id
-        # for point in points:
-        #     pose = Pose()
-        #     pose.position = Point(x = point[0], y = point[1], z = -0.2)
-        #     pose.orientation = Quaternion(x = 0.0 , y = 0.707 , z = 0.0 , w = 0.707)
-        #     p_array.poses.append(pose)
-        # self.publisher_.publish(p_array)
+            hand_T_body = geometry_pb2.SE3Pose(position=hand_pos, rotation=hand_Q)
 
-        
-        # for pose in p_array.poses:
-        #     # Make the arm pose RobotCommand
-        #     # Build a position to move the arm to (in meters, relative to and expressed in the gravity aligned body frame).
-        #     x, y, z = pose.position.x, pose.position.y, pose.position.z
-        #     hand_pos = geometry_pb2.Vec3(x=x, y=y, z=z)
+            hand_T_odom = hand_T_grav_body * math_helpers.SE3Pose.from_obj(hand_T_body)
 
-        #     # Rotation as a quaternion
-        #     qw = pose.orientation.w
-        #     qx = pose.orientation.x
-        #     qy = pose.orientation.y
-        #     qz = pose.orientation.z
-        #     hand_Q = geometry_pb2.Quaternion(w=qw, x=qx, y=qy, z=qz)
+            # duration in seconds
+            seconds = 7
 
-        #     hand_T_body = geometry_pb2.SE3Pose(position=hand_pos, rotation=hand_Q)
+            arm_command = RobotCommandBuilder.arm_pose_command(
+                hand_T_odom.x,
+                hand_T_odom.y,
+                hand_T_odom.z,
+                hand_T_odom.rot.w,
+                hand_T_odom.rot.x,
+                hand_T_odom.rot.y,
+                hand_T_odom.rot.z,
+                ODOM_FRAME_NAME,
+                seconds,
+            )
 
-        #     hand_T_odom = hand_T_grav_body * math_helpers.SE3Pose.from_obj(hand_T_body)
+            follow_arm_command = RobotCommandBuilder.follow_arm_command()
+            command = RobotCommandBuilder.build_synchro_command(follow_arm_command, arm_command)
 
-        #     # duration in seconds
-        #     seconds = 5
-
-        #     arm_command = RobotCommandBuilder.arm_pose_command(
-        #         hand_T_odom.x,
-        #         hand_T_odom.y,
-        #         hand_T_odom.z,
-        #         hand_T_odom.rot.w,
-        #         hand_T_odom.rot.x,
-        #         hand_T_odom.rot.y,
-        #         hand_T_odom.rot.z,
-        #         ODOM_FRAME_NAME,
-        #         seconds,
-        #     )
-
-        #     follow_arm_command = RobotCommandBuilder.follow_arm_command()
-        #     command = RobotCommandBuilder.build_synchro_command(follow_arm_command, arm_command)
-
-
-        #     # Convert to a ROS message
-        #     action_goal = RobotCommand.Goal()
-        #     conv.convert_proto_to_bosdyn_msgs_robot_command(command, action_goal.command)
-        #     # Send the request and wait until the arm arrives at the goal
-        #     self.get_logger().info("Moving arm to position 1.")
-        #     robot_command_client.send_goal_and_wait("arm_move_one", action_goal)
+            # Convert to a ROS message
+            action_goal = RobotCommand.Goal()
+            conv.convert_proto_to_bosdyn_msgs_robot_command(command, action_goal.command)
+            # Send the request and wait until the arm arrives at the goal
+            self.get_logger().info("Stowing arm")
+            robot_command_client.send_goal_and_wait("arm_move_one", action_goal)
      
 
-        # #Stow arm
-        # action_goal = RobotCommand.Goal()
-        # command = RobotCommandBuilder.arm_stow_command()
-        # conv.convert_proto_to_bosdyn_msgs_robot_command(command, action_goal.command)
-        # self.get_logger().info("Stowing arm")
-        # robot_command_client.send_goal_and_wait("stow arm", action_goal)
+        #Stow arm
+        action_goal = RobotCommand.Goal()
+        command = RobotCommandBuilder.arm_stow_command()
+        conv.convert_proto_to_bosdyn_msgs_robot_command(command, action_goal.command)
+        self.get_logger().info("Stowing arm")
+        robot_command_client.send_goal_and_wait("stow arm", action_goal)
 
-        # tf_listener.shutdown()
+        tf_listener.shutdown()
 
         return True
 
