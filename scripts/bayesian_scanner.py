@@ -6,9 +6,13 @@ import rclpy
 import time
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.node import Node
+import bdai_ros2_wrappers.process as ros_process
+import bdai_ros2_wrappers.scope as ros_scope
 from sensor_msgs.msg import PointCloud2, PointField
-from std_msgs.msg import Header
+from sensor_msgs_py import point_cloud2 as pc2
+from std_msgs.msg import Header, ColorRGBA
 from geometry_msgs.msg import PolygonStamped, Pose, Point, Point32, Quaternion
+from visualization_msgs.msg import Marker, MarkerArray
 
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
@@ -20,21 +24,25 @@ from bosdyn.api import geometry_pb2
 from bosdyn.client import math_helpers
 from bosdyn.client.frame_helpers import GRAV_ALIGNED_BODY_FRAME_NAME, ODOM_FRAME_NAME
 from bosdyn.client.robot_command import RobotCommandBuilder
-from utilities.simple_spot_commander import SimpleSpotCommander
-from utilities.tf_listener_wrapper import TFListenerWrapper
-import spot_driver.conversions as conv
+from spot_examples.simple_spot_commander import SimpleSpotCommander
+from bdai_ros2_wrappers.tf_listener_wrapper import TFListenerWrapper
+from bosdyn_msgs.conversions import convert
 from spot_msgs.action import RobotCommand  # type: ignore
 
 class BayesianScanner(Node):
     def __init__(self):
         super().__init__("bayesian_scanning")
-        self.declare_parameter('box_length', 2.5)
+        self.declare_parameter('box_length', 2.0)
         self.declare_parameter('box_width', 2.5)
-        self.declare_parameter('frame_id', "odom")
+        self.declare_parameter('box_resolution', 0.05)
+        self.declare_parameter('frame_id', "map")
+        self.declare_parameter('cloud_topic', "cloud_map")
 
-        self.frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
         self.l = self.get_parameter('box_length').get_parameter_value().double_value
         self.w = self.get_parameter('box_width').get_parameter_value().double_value
+        self.r = self.get_parameter('box_resolution').get_parameter_value().double_value
+        self.frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
+        self.cloud_topic = self.get_parameter('cloud_topic').get_parameter_value().string_value
 
         self.box_pub_ = self.create_publisher(PolygonStamped, 'bounding_box', 10)
         self.ground_truth_pub_ = self.create_publisher(PointCloud2, 'ground_truth', 10)
@@ -42,8 +50,66 @@ class BayesianScanner(Node):
         self.ground_truth_timer_ = self.create_timer(0.5, self.ground_truth)
         self.samples_pub_ = self.create_publisher(PointCloud2, 'sampled_points', 10)
         self.gp_pub_ = self.create_publisher(PointCloud2, 'radiation_map', 10)
+        self.grid_pub = self.create_publisher(MarkerArray, 'indication_function', 10)
+        self.cloud_sub = self.create_subscription(PointCloud2, self.cloud_topic, self.indication_function, 10)
+
+        #Initialize indication function grid
+        self.grid_width = int(self.l / self.r)
+        self.grid_height = int(self.w / self.r)
+        self.indication_func = np.zeros((2 * self.grid_height, self.grid_width), dtype=int)
+
+        self.spot_node_ = ros_scope.node()
+        if self.spot_node_ is None:
+                raise ValueError("no ROS 2 node available (did you use bdai_ros2_wrapper.process.main?)")
+
         self.ground_truth()
-        self.scan()
+        #self.scan()
+
+    def indication_function(self, cloud):
+        # Convert PointCloud2 to array of points
+        points = np.array(list(pc2.read_points(cloud, field_names=("x", "y", "z"), skip_nans=True)))
+
+        # Clear grid
+        self.indication_func.fill(1)
+
+        # for p in points:
+        #     x = p[0]
+        #     y = p[1]
+        #     if -(self.grid_width * self.r) <= x < self.grid_width * self.r and -(self.grid_height * self.r) <= y < self.grid_height * self.r:
+        #         grid_idx_x = int(x // self.r)
+        #         grid_idx_y = int(y // self.r)
+        #         self.indication_func[grid_idx_y, grid_idx_x] = 1
+
+
+        #Publish to ROS as marker_array
+        marker_array = MarkerArray()
+        marker_id = 0
+
+        for y in range(2*self.grid_height):
+            for x in range(self.grid_width):
+                if self.indication_func[y, x] == 1:
+                    marker = Marker()
+                    marker.header.frame_id = self.frame_id
+                    marker.header.stamp = self.get_clock().now().to_msg()
+                    marker.ns = "grid"
+                    marker.id = marker_id
+                    marker_id += 1
+                    marker.type = Marker.CUBE
+                    marker.action = Marker.ADD
+                    marker.pose.position.x = 0.3 + x * self.r
+                    marker.pose.position.y = -y * self.r
+                    marker.pose.position.z = 0.0
+                    marker.pose.orientation.x = 0.0
+                    marker.pose.orientation.y = 0.0
+                    marker.pose.orientation.z = 0.0
+                    marker.pose.orientation.w = 1.0
+                    marker.scale.x = self.r
+                    marker.scale.y = self.r
+                    marker.scale.z = 0.1  # height of the marker
+                    marker.color = ColorRGBA(r=0.0, g=0.0, b=1.0, a=0.5)
+                    marker_array.markers.append(marker)
+        self.grid_pub.publish(marker_array)
+
 
     def bounding_box(self):
         bounding_box = PolygonStamped()
@@ -64,8 +130,8 @@ class BayesianScanner(Node):
     
     def ground_truth(self):
         # Plot the ground truth function
-        x = np.linspace(0, self.l, 100)
-        y = np.linspace(0, self.w, 100)
+        x = np.linspace(0.3, self.l+0.3, 100)
+        y = np.linspace(-self.w, self.w, 100)
         X, Y = np.meshgrid(x, y)
         Z = np.array([self.function([xx, yy]) for xx, yy in zip(np.ravel(X), np.ravel(Y))])
         Z = Z.reshape(X.shape)
@@ -147,10 +213,24 @@ class BayesianScanner(Node):
         y_max = rad_reading
 
         for _ in range(10):
-            tf_listener = TFListenerWrapper(
-            "bo_scanner_tf", wait_for_transform=[ODOM_FRAME_NAME, "odom"]
-            )
+            tf_listener = TFListenerWrapper(self.spot_node_)
+            tf_listener.wait_for_a_tform_b(ODOM_FRAME_NAME, "odom")
+
+            #tf_listener = TFListenerWrapper(
+            #"bo_scanner_tf", wait_for_transform=[ODOM_FRAME_NAME, "odom"]
+            #)
             hand_T_grav_body = tf_listener.lookup_a_tform_b(ODOM_FRAME_NAME, "odom")
+            hand_T_grav_body_se3 = math_helpers.SE3Pose(
+                hand_T_grav_body.transform.translation.x,
+                hand_T_grav_body.transform.translation.y,
+                hand_T_grav_body.transform.translation.z,
+                math_helpers.Quat(
+                    hand_T_grav_body.transform.rotation.w,
+                    hand_T_grav_body.transform.rotation.x,
+                    hand_T_grav_body.transform.rotation.y,
+                    hand_T_grav_body.transform.rotation.z,
+                ),
+            )
 
             x_next = self.select_next(self.probability_of_improvement, gp, [(0, self.w) , (0,self.l)], y_max)
             y_next = self.function(x_next)
@@ -176,12 +256,10 @@ class BayesianScanner(Node):
             Z_std = Z_std.reshape(X.shape)
             tuples = np.dstack((X, Y, Z_pred)).reshape(-1,3)
             pc2 = self.create_pointcloud(tuples, self.frame_id)
-            self.gp_pub_.publish(pc2)
+            self.gp_pub_.publish(pc2)       
 
-            
-
-            robot = SimpleSpotCommander()
-            robot_command_client = ActionClientWrapper(RobotCommand, "robot_command", "surface_scanner_action_node")
+            robot = SimpleSpotCommander(node=self.spot_node_)
+            robot_command_client = ActionClientWrapper(RobotCommand, "robot_command", self.spot_node_)
 
             #Claim robot
             self.get_logger().info("Claiming robot")
@@ -208,7 +286,7 @@ class BayesianScanner(Node):
 
             hand_T_body = geometry_pb2.SE3Pose(position=hand_pos, rotation=hand_Q)
 
-            hand_T_odom = hand_T_grav_body * math_helpers.SE3Pose.from_obj(hand_T_body)
+            hand_T_odom = hand_T_grav_body_se3 * math_helpers.SE3Pose.from_obj(hand_T_body)
 
             # duration in seconds
             seconds = 7
@@ -230,26 +308,24 @@ class BayesianScanner(Node):
 
             # Convert to a ROS message
             action_goal = RobotCommand.Goal()
-            conv.convert_proto_to_bosdyn_msgs_robot_command(command, action_goal.command)
+            convert(command, action_goal.command)
             # Send the request and wait until the arm arrives at the goal
-            self.get_logger().info("Stowing arm")
-            robot_command_client.send_goal_and_wait("arm_move_one", action_goal)
+            robot_command_client.send_goal_and_wait("bayesian_optimization", action_goal)
      
 
         #Stow arm
         action_goal = RobotCommand.Goal()
         command = RobotCommandBuilder.arm_stow_command()
-        conv.convert_proto_to_bosdyn_msgs_robot_command(command, action_goal.command)
+        convert(command, action_goal.command)
         self.get_logger().info("Stowing arm")
-        robot_command_client.send_goal_and_wait("stow arm", action_goal)
+        robot_command_client.send_goal_and_wait("bayesian_optimization", action_goal)
 
         tf_listener.shutdown()
 
         return True
 
-
+@ros_process.main()
 def main(args=None):
-    rclpy.init(args=args)
     bayesian_scanner = BayesianScanner()
     rclpy.spin(bayesian_scanner)
     bayesian_scanner.destroy_node()

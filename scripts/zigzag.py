@@ -10,10 +10,10 @@ from bosdyn.api import geometry_pb2
 from bosdyn.client import math_helpers
 from bosdyn.client.frame_helpers import GRAV_ALIGNED_BODY_FRAME_NAME, ODOM_FRAME_NAME
 from bosdyn.client.robot_command import RobotCommandBuilder
-from utilities.simple_spot_commander import SimpleSpotCommander
-from utilities.tf_listener_wrapper import TFListenerWrapper
+from spot_examples.simple_spot_commander import SimpleSpotCommander
+from bdai_ros2_wrappers.tf_listener_wrapper import TFListenerWrapper
 
-import spot_driver.conversions as conv
+import bosdyn_msgs.conversions as conv
 from spot_msgs.action import RobotCommand  # type: ignore
 from sensor_msgs.msg import PointCloud2
 from geometry_msgs.msg import PoseArray, Pose, Point, Quaternion
