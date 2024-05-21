@@ -198,7 +198,6 @@ class BayesianScanner(Node):
                 
         return min_x
 
-
     def scan(self):
         # Create Gaussian Process Surrogate
         kernel = C(1.0, (1e-4, 1e1)) * RBF([1.0, 1.0], (1e-4, 1e1))
