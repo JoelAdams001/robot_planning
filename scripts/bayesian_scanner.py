@@ -3,7 +3,7 @@
 import struct
 import numpy as np
 import rclpy
-import time
+from rclpy.time import Time
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.node import Node
 import bdai_ros2_wrappers.process as ros_process
@@ -11,7 +11,7 @@ import bdai_ros2_wrappers.scope as ros_scope
 from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs_py import point_cloud2 as pc2
 from std_msgs.msg import Header, ColorRGBA
-from geometry_msgs.msg import PolygonStamped, Pose, Point, Point32, Quaternion
+from geometry_msgs.msg import PolygonStamped, Pose, Point, Point32, Quaternion, Vector3Stamped
 from visualization_msgs.msg import Marker, MarkerArray
 
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -20,6 +20,7 @@ from scipy.optimize import minimize
 from scipy.stats import norm
 
 from bdai_ros2_wrappers.action_client import ActionClientWrapper
+from bdai_ros2_wrappers.action_handle import ActionHandle
 from bosdyn.api import geometry_pb2
 from bosdyn.client import math_helpers
 from bosdyn.client.frame_helpers import GRAV_ALIGNED_BODY_FRAME_NAME, ODOM_FRAME_NAME
@@ -28,15 +29,19 @@ from spot_examples.simple_spot_commander import SimpleSpotCommander
 from bdai_ros2_wrappers.tf_listener_wrapper import TFListenerWrapper
 from bosdyn_msgs.conversions import convert
 from spot_msgs.action import RobotCommand  # type: ignore
+import threading
+import math
 
 class BayesianScanner(Node):
     def __init__(self):
         super().__init__("bayesian_scanning")
-        self.declare_parameter('box_length', 2.0)
-        self.declare_parameter('box_width', 2.5)
+        self.declare_parameter('box_length', 1.7)
+        self.declare_parameter('box_width', 1.7)
         self.declare_parameter('box_resolution', 0.05)
         self.declare_parameter('frame_id', "map")
         self.declare_parameter('cloud_topic', "cloud_map")
+        self.declare_parameter('max_arm_force', 90.0)
+        self.declare_parameter('num_samples', 10)
 
         self.l = self.get_parameter('box_length').get_parameter_value().double_value
         self.w = self.get_parameter('box_width').get_parameter_value().double_value
@@ -44,26 +49,39 @@ class BayesianScanner(Node):
         self.frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
         self.cloud_topic = self.get_parameter('cloud_topic').get_parameter_value().string_value
 
-        self.box_pub_ = self.create_publisher(PolygonStamped, 'bounding_box', 10)
-        self.ground_truth_pub_ = self.create_publisher(PointCloud2, 'ground_truth', 10)
-        self.box_timer_ = self.create_timer(0.5, self.bounding_box)
-        self.ground_truth_timer_ = self.create_timer(0.5, self.ground_truth)
+        #self.box_pub_ = self.create_publisher(PolygonStamped, 'bounding_box', 10)
+        #self.ground_truth_pub_ = self.create_publisher(PointCloud2, 'ground_truth', 10)
+        #self.box_timer_ = self.create_timer(0.5, self.bounding_box)
+        #self.ground_truth_timer_ = self.create_timer(0.5, self.ground_truth)
         self.samples_pub_ = self.create_publisher(PointCloud2, 'sampled_points', 10)
         self.gp_pub_ = self.create_publisher(PointCloud2, 'radiation_map', 10)
-        self.grid_pub = self.create_publisher(MarkerArray, 'indication_function', 10)
-        self.cloud_sub = self.create_subscription(PointCloud2, self.cloud_topic, self.indication_function, 10)
+        #self.grid_pub = self.create_publisher(MarkerArray, 'indication_function', 10)
+        #self.cloud_sub = self.create_subscription(PointCloud2, self.cloud_topic, self.indication_function, 10)
+        self.force_sub = self.create_subscription(Vector3Stamped, "/status/end_effector_force", self.force_callback, 1)
 
         #Initialize indication function grid
         self.grid_width = int(self.l / self.r)
         self.grid_height = int(self.w / self.r)
+        self.fb_time = Time()
         self.indication_func = np.zeros((2 * self.grid_height, self.grid_width), dtype=int)
 
         self.spot_node_ = ros_scope.node()
         if self.spot_node_ is None:
                 raise ValueError("no ROS 2 node available (did you use bdai_ros2_wrapper.process.main?)")
+        self.force = Vector3Stamped()
+        self.scan_thread = threading.Thread(target=self.scan)
+        self.scan_thread.start()
 
-        self.ground_truth()
-        #self.scan()
+    def force_callback(self, force_msg):
+         self.force = force_msg
+         self.vec_mag = math.sqrt(self.force.vector.x**2 + self.force.vector.y**2 + self.force.vector.z**2)
+    
+    def feedback_callback(self, feedback_msg):
+        self.fb_time = self.get_clock().now()
+        response = feedback_msg.feedback
+        self.trajectory_status = (
+            response.feedback.command.synchronized_feedback.arm_command_feedback.feedback.arm_cartesian_feedback.measured_pos_distance_to_goal
+        )
 
     def indication_function(self, cloud):
         # Convert PointCloud2 to array of points
@@ -110,15 +128,14 @@ class BayesianScanner(Node):
                     marker_array.markers.append(marker)
         self.grid_pub.publish(marker_array)
 
-
     def bounding_box(self):
         bounding_box = PolygonStamped()
         bounding_box.header = Header(stamp=self.get_clock().now().to_msg(), frame_id=self.frame_id)
         points = [
-        Point32(x=0.3, y=-self.w, z=0.0),
-        Point32(x=0.3 + self.l, y=-self.w, z=0.0),
-        Point32(x=0.3 + self.l, y=self.w, z=0.0),
-        Point32(x=0.3, y=self.w, z=0.0)
+        Point32(y=0.4, x=-self.w, z=0.0),
+        Point32(y=0.4 + self.l, x=-self.w, z=0.0),
+        Point32(y=0.4 + self.l, x=self.w, z=0.0),
+        Point32(y=0.4, x=self.w, z=0.0)
         ]
 
         bounding_box.polygon.points = points
@@ -130,8 +147,8 @@ class BayesianScanner(Node):
     
     def ground_truth(self):
         # Plot the ground truth function
-        x = np.linspace(0.3, self.l+0.3, 100)
-        y = np.linspace(-self.w, self.w, 100)
+        x = np.linspace(-self.w, self.w, 200)
+        y = np.linspace(0.4, self.l+0.4, 100)
         X, Y = np.meshgrid(x, y)
         Z = np.array([self.function([xx, yy]) for xx, yy in zip(np.ravel(X), np.ravel(Y))])
         Z = Z.reshape(X.shape)
@@ -166,7 +183,7 @@ class BayesianScanner(Node):
 
         return pc2
 
-    def probability_of_improvement(self, X, gp, y_max, xi= 0.01):
+    def probability_of_improvement(self, X, gp, y_max, xi= 0.2):
         """Computes the PI at points X based on existing samples using a Gaussian process surrogate model."""
         mu, sigma = gp.predict(X, return_std=True)
         with np.errstate(divide='warn'):
@@ -195,31 +212,12 @@ class BayesianScanner(Node):
             if res.fun < min_val:
                 min_val = res.fun
                 min_x = res.x
-                
         return min_x
-
-    def scan(self):
-        # Create Gaussian Process Surrogate
-        kernel = C(1.0, (1e-4, 1e1)) * RBF([1.0, 1.0], (1e-4, 1e1))
-        gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=10)
-
-        #Sample first point
-        #Note here x_sample refers to the array of coords (x,y), y_sample is array of rad readings
-        X_sample = np.array([[0.3, 0.3]])
-        rad_reading = self.function(X_sample[0])
-        y_sample = np.array([[rad_reading]])
-        gp.fit(X_sample, y_sample)
-        y_max = rad_reading
-
-        for _ in range(10):
-            tf_listener = TFListenerWrapper(self.spot_node_)
-            tf_listener.wait_for_a_tform_b(ODOM_FRAME_NAME, "odom")
-
-            #tf_listener = TFListenerWrapper(
-            #"bo_scanner_tf", wait_for_transform=[ODOM_FRAME_NAME, "odom"]
-            #)
-            hand_T_grav_body = tf_listener.lookup_a_tform_b(ODOM_FRAME_NAME, "odom")
-            hand_T_grav_body_se3 = math_helpers.SE3Pose(
+    
+    def sample(self, gp, y_max, robot_command_client, tf_listener):
+        #Get tranform for arm
+        hand_T_grav_body = tf_listener.lookup_a_tform_b(ODOM_FRAME_NAME, "odom")
+        hand_T_grav_body_se3 = math_helpers.SE3Pose(
                 hand_T_grav_body.transform.translation.x,
                 hand_T_grav_body.transform.translation.y,
                 hand_T_grav_body.transform.translation.z,
@@ -230,87 +228,130 @@ class BayesianScanner(Node):
                     hand_T_grav_body.transform.rotation.z,
                 ),
             )
+        #Select next point
+        x_next = self.select_next(self.probability_of_improvement, gp, [(0, self.w) , (0,self.l)], y_max)    
 
-            x_next = self.select_next(self.probability_of_improvement, gp, [(0, self.w) , (0,self.l)], y_max)
-            y_next = self.function(x_next)
-            if y_next > y_max:
-               y_max = y_next
-            X_sample = np.vstack((X_sample, x_next))
-            y_sample = np.append(y_sample, y_next)
-            gp.fit(X_sample, y_sample)
+        # Make the arm pose RobotCommand
+        # Build a position to move the arm to (in meters, relative to and expressed in the gravity aligned body frame).
+        pose = Pose()
+        pose.position = Point(x = x_next[0], y = x_next[1], z = 0.1)
+        pose.orientation = Quaternion(x = 0.0 , y = 0.707 , z = 0.0 , w = 0.707)
+        x, y, z = pose.position.x, pose.position.y, pose.position.z
+        hand_pos = geometry_pb2.Vec3(x=x, y=y, z=z)
 
-            tuples = [(x[0], x[1], y) for x, y in zip(X_sample, y_sample)]
-            pc2 = self.create_pointcloud(tuples, self.frame_id)
-            self.samples_pub_.publish(pc2)
+        # Rotation as a quaternion
+        qw = pose.orientation.w
+        qx = pose.orientation.x
+        qy = pose.orientation.y
+        qz = pose.orientation.z
+        hand_Q = geometry_pb2.Quaternion(w=qw, x=qx, y=qy, z=qz)
 
-            #Publish current surrogate model
-            x = np.linspace(0, self.l, 100)
-            y = np.linspace(0, self.w, 100)
-            X, Y = np.meshgrid(x, y)
-            X_flat = X.ravel()
-            Y_flat = Y.ravel()
-            XY = np.vstack([X_flat, Y_flat]).T
-            Z_pred, Z_std = gp.predict(XY, return_std=True)
-            Z_pred = Z_pred.reshape(X.shape)
-            Z_std = Z_std.reshape(X.shape)
-            tuples = np.dstack((X, Y, Z_pred)).reshape(-1,3)
-            pc2 = self.create_pointcloud(tuples, self.frame_id)
-            self.gp_pub_.publish(pc2)       
+        hand_T_body = geometry_pb2.SE3Pose(position=hand_pos, rotation=hand_Q)
 
-            robot = SimpleSpotCommander(node=self.spot_node_)
-            robot_command_client = ActionClientWrapper(RobotCommand, "robot_command", self.spot_node_)
+        hand_T_odom = hand_T_grav_body_se3 * math_helpers.SE3Pose.from_obj(hand_T_body)
 
-            #Claim robot
-            self.get_logger().info("Claiming robot")
-            result = robot.command("claim")
-            if not result.success:
-                self.get_logger().error("Unable to claim robot message was " + result.message)
+        # duration in seconds
+        seconds = 7
+
+        arm_command = RobotCommandBuilder.arm_pose_command(
+            hand_T_odom.x,
+            hand_T_odom.y,
+            hand_T_odom.z,
+            hand_T_odom.rot.w,
+            hand_T_odom.rot.x,
+            hand_T_odom.rot.y,
+            hand_T_odom.rot.z,
+            ODOM_FRAME_NAME,
+            seconds,
+        )
+
+        follow_arm_command = RobotCommandBuilder.follow_arm_command()
+        command = RobotCommandBuilder.build_synchro_command(follow_arm_command, arm_command)
+
+        # Convert to a ROS message
+        action_goal = RobotCommand.Goal()
+        convert(command, action_goal.command)
+        action_handle = ActionHandle(RobotCommand)
+        action_handle.set_feedback_callback(self.feedback_callback)
+        fb_start_time = self.get_clock().now()
+        send_goal_future = robot_command_client.send_goal_async(action_goal, feedback_callback=action_handle.get_feedback_callback)
+        self.trajectory_status = 100.0
+        self.vec_mag = 0.0
+        max_force = self.get_parameter('max_arm_force').get_parameter_value().double_value
+        
+
+        while (self.trajectory_status > 0.001):
+            fb_duration = self.fb_time - fb_start_time
+            if (self.vec_mag > max_force and fb_duration.seconds() > 1):
+                action_goal = RobotCommand.Goal()
+                command = RobotCommandBuilder.arm_stow_command()
+                convert(command, action_goal.command)
+                print(self.vec_mag)
+                self.get_logger().info("Max force exceeded, stowing arm and dropping current point")
+                robot_command_client.send_goal_and_wait("bayesian_optimization", action_goal)
                 return False
-            self.get_logger().info("Claimed robot")
+        #Take 'measurement'
+        y_next = self.function(x_next)
+        if y_next > y_max:
+            y_max = y_next
 
-            # Make the arm pose RobotCommand
-            # Build a position to move the arm to (in meters, relative to and expressed in the gravity aligned body frame).
-            pose = Pose()
-            pose.position = Point(x = x_next[0], y = x_next[1], z = 0.1)
-            pose.orientation = Quaternion(x = 0.0 , y = 0.707 , z = 0.0 , w = 0.707)
-            x, y, z = pose.position.x, pose.position.y, pose.position.z
-            hand_pos = geometry_pb2.Vec3(x=x, y=y, z=z)
+        return x_next, y_next, y_max
 
-            # Rotation as a quaternion
-            qw = pose.orientation.w
-            qx = pose.orientation.x
-            qy = pose.orientation.y
-            qz = pose.orientation.z
-            hand_Q = geometry_pb2.Quaternion(w=qw, x=qx, y=qy, z=qz)
+    def scan(self):
+        #Set up some robot thigns
+        robot = SimpleSpotCommander(node=self.spot_node_)
+        robot_command_client = ActionClientWrapper(RobotCommand, "robot_command", self.spot_node_)
+        tf_listener = TFListenerWrapper(self.spot_node_)
+        tf_listener.wait_for_a_tform_b(ODOM_FRAME_NAME, "odom")
 
-            hand_T_body = geometry_pb2.SE3Pose(position=hand_pos, rotation=hand_Q)
+        #Claim robot
+        self.get_logger().info("Claiming robot")
+        result = robot.command("claim")
+        if not result.success:
+            self.get_logger().error("Unable to claim robot message was " + result.message)
+            return False
+        self.get_logger().info("Claimed robot")
+        # Create Gaussian Process Surrogate
+        kernel = C(1.0, (1e-4, 1e1)) * RBF([1.0, 1.0], (1e-4, 1e1))
+        gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=10)
 
-            hand_T_odom = hand_T_grav_body_se3 * math_helpers.SE3Pose.from_obj(hand_T_body)
+        #Sample first point
+        #Note here x_sample refers to the array of coords (x,y), y_sample is array of rad readings
+        X_sample = np.array([[0.4, 0.4]])
+        rad_reading = self.function(X_sample[0])
+        y_sample = np.array([[rad_reading]])
+        gp.fit(X_sample, y_sample)
+        y_max = rad_reading
 
-            # duration in seconds
-            seconds = 7
+        num_samples = self.get_parameter('num_samples').get_parameter_value().integer_value
+        while(X_sample.shape[0] < num_samples):
+            result = self.sample(gp, y_max, robot_command_client, tf_listener)
+            if result:
+                x_next, y_next, y_max = result
 
-            arm_command = RobotCommandBuilder.arm_pose_command(
-                hand_T_odom.x,
-                hand_T_odom.y,
-                hand_T_odom.z,
-                hand_T_odom.rot.w,
-                hand_T_odom.rot.x,
-                hand_T_odom.rot.y,
-                hand_T_odom.rot.z,
-                ODOM_FRAME_NAME,
-                seconds,
-            )
+                #Update GP model
+                X_sample = np.vstack((X_sample, x_next))
+                y_sample = np.append(y_sample, y_next)
+                gp.fit(X_sample, y_sample)
 
-            follow_arm_command = RobotCommandBuilder.follow_arm_command()
-            command = RobotCommandBuilder.build_synchro_command(follow_arm_command, arm_command)
+                #Publish array of sampled points
+                tuples = [(x[0], x[1], y) for x, y in zip(X_sample, y_sample)]
+                pc2 = self.create_pointcloud(tuples, self.frame_id)
+                self.samples_pub_.publish(pc2)
 
-            # Convert to a ROS message
-            action_goal = RobotCommand.Goal()
-            convert(command, action_goal.command)
-            # Send the request and wait until the arm arrives at the goal
-            robot_command_client.send_goal_and_wait("bayesian_optimization", action_goal)
-     
+                #Publish current surrogate model
+                x = np.linspace(-self.w, self.w, 200)
+                y = np.linspace(0.4, self.l+0.4, 100)
+                X, Y = np.meshgrid(x, y)
+                X_flat = X.ravel()
+                Y_flat = Y.ravel()
+                XY = np.vstack([X_flat, Y_flat]).T
+                Z_pred, Z_std = gp.predict(XY, return_std=True)
+                Z_pred = Z_pred.reshape(X.shape)
+                Z_std = Z_std.reshape(X.shape)
+                tuples = np.dstack((X, Y, Z_pred)).reshape(-1,3)
+                pc2 = self.create_pointcloud(tuples, self.frame_id)
+                self.gp_pub_.publish(pc2)       
 
         #Stow arm
         action_goal = RobotCommand.Goal()

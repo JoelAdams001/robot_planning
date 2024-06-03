@@ -21,11 +21,9 @@ from bosdyn_msgs.conversions import convert
 from spot_msgs.action import RobotCommand  # type: ignore
 from sensor_msgs.msg import PointCloud2
 from geometry_msgs.msg import PoseArray, Pose, Point, Quaternion, Vector3Stamped
-import time
 import threading
 import math
 
-#/status/end_effector_force
 
 class AsyncTest(Node):
     def __init__(self):
@@ -37,9 +35,13 @@ class AsyncTest(Node):
         self.force = Vector3Stamped()
         self.test_thread = threading.Thread(target=self.test)
         self.test_thread.start()
+        self.count = 0
 
     def force_callback(self, force_msg):
          self.force = force_msg
+         print('feedback')
+         print(self.count)
+         self.count += 1
     
     def feedback_callback(self, feedback_msg):
         response = feedback_msg.feedback
