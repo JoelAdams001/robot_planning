@@ -40,7 +40,7 @@ class BayesianScanner(Node):
         self.declare_parameter('box_resolution', 0.05)
         self.declare_parameter('frame_id', "map")
         self.declare_parameter('cloud_topic', "cloud_map")
-        self.declare_parameter('max_arm_force', 90.0)
+        self.declare_parameter('max_arm_force', 30.0)
         self.declare_parameter('num_samples', 10)
 
         self.l = self.get_parameter('box_length').get_parameter_value().double_value
@@ -62,8 +62,9 @@ class BayesianScanner(Node):
         #Initialize indication function grid
         self.grid_width = int(self.l / self.r)
         self.grid_height = int(self.w / self.r)
-        self.fb_time = Time()
+        self.fb_time = self.get_clock().now()
         self.indication_func = np.zeros((2 * self.grid_height, self.grid_width), dtype=int)
+        self.fail_count = 0
 
         self.spot_node_ = ros_scope.node()
         if self.spot_node_ is None:
@@ -183,7 +184,14 @@ class BayesianScanner(Node):
 
         return pc2
 
-    def probability_of_improvement(self, X, gp, y_max, xi= 0.2):
+    def probability_of_improvement(self, X, gp, y_max):
+        #Calculate xi based on number of times consecutively the robot failed to reach its goal point
+        if (self.fail_count >= 0 and self.fail_count <= 5):
+            xi = (1/5)*math.exp(0.5*self.fail_count)
+        else:
+            xi = 2.5
+        #print(self.fail_count)
+        print("Current xi: ", str(xi))
         """Computes the PI at points X based on existing samples using a Gaussian process surrogate model."""
         mu, sigma = gp.predict(X, return_std=True)
         with np.errstate(divide='warn'):
@@ -229,12 +237,12 @@ class BayesianScanner(Node):
                 ),
             )
         #Select next point
-        x_next = self.select_next(self.probability_of_improvement, gp, [(0, self.w) , (0,self.l)], y_max)    
+        x_next = self.select_next(self.probability_of_improvement, gp, [(-self.w, self.w) , (0.8, self.l+0.8)], y_max)    
 
         # Make the arm pose RobotCommand
         # Build a position to move the arm to (in meters, relative to and expressed in the gravity aligned body frame).
         pose = Pose()
-        pose.position = Point(x = x_next[0], y = x_next[1], z = 0.1)
+        pose.position = Point(x = x_next[0], y = x_next[1], z = 0.2)
         pose.orientation = Quaternion(x = 0.0 , y = 0.707 , z = 0.0 , w = 0.707)
         x, y, z = pose.position.x, pose.position.y, pose.position.z
         hand_pos = geometry_pb2.Vec3(x=x, y=y, z=z)
@@ -248,7 +256,7 @@ class BayesianScanner(Node):
 
         hand_T_body = geometry_pb2.SE3Pose(position=hand_pos, rotation=hand_Q)
 
-        hand_T_odom = hand_T_grav_body_se3 * math_helpers.SE3Pose.from_obj(hand_T_body)
+        hand_T_odom = hand_T_grav_body_se3 * math_helpers.SE3Pose.from_proto(hand_T_body)
 
         # duration in seconds
         seconds = 7
@@ -280,21 +288,23 @@ class BayesianScanner(Node):
         max_force = self.get_parameter('max_arm_force').get_parameter_value().double_value
         
 
-        while (self.trajectory_status > 0.001):
-            fb_duration = self.fb_time - fb_start_time
-            if (self.vec_mag > max_force and fb_duration.seconds() > 1):
+        while (self.trajectory_status > 0.03):
+            #fb_duration = self.fb_time - fb_start_time
+            if (self.vec_mag > max_force and (self.fb_time.nanoseconds - fb_start_time.nanoseconds) > 2e+9):
+                print(self.vec_mag)
                 action_goal = RobotCommand.Goal()
                 command = RobotCommandBuilder.arm_stow_command()
                 convert(command, action_goal.command)
-                print(self.vec_mag)
                 self.get_logger().info("Max force exceeded, stowing arm and dropping current point")
                 robot_command_client.send_goal_and_wait("bayesian_optimization", action_goal)
+                self.fail_count += 1
                 return False
         #Take 'measurement'
         y_next = self.function(x_next)
         if y_next > y_max:
             y_max = y_next
 
+        self.fail_count = 0
         return x_next, y_next, y_max
 
     def scan(self):
@@ -341,7 +351,7 @@ class BayesianScanner(Node):
 
                 #Publish current surrogate model
                 x = np.linspace(-self.w, self.w, 200)
-                y = np.linspace(0.4, self.l+0.4, 100)
+                y = np.linspace(0.8, self.l+0.8, 100)
                 X, Y = np.meshgrid(x, y)
                 X_flat = X.ravel()
                 Y_flat = Y.ravel()
