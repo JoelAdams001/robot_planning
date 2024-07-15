@@ -138,7 +138,6 @@ class ScanningBehavior(rclpy.node.Node):
         result = future.result()
         if result:
             self.get_logger().info('Updated model successfully')
-
     
     def stow_arm(self):
          if self.claim_robot():

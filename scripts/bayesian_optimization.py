@@ -47,7 +47,7 @@ class BayesianOptimization(Node):
         # Sample first point
         # Note here x_sample refers to the array of coords (x,y), y_sample is array of rad readings
         self.X_sample = np.array([[0.4, 0.4]])
-        rad_reading = self.function(self.X_sample[0])
+        rad_reading = 50
         self.y_sample = np.array([[rad_reading]])
         self.gp.fit(self.X_sample, self.y_sample)
         self.y_max = rad_reading
