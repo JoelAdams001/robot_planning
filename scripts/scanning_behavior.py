@@ -1,4 +1,5 @@
 import rclpy
+from rclpy.node import Node
 import bdai_ros2_wrappers.process as ros_process
 import bdai_ros2_wrappers.scope as ros_scope
 from rclpy.action import ActionClient
@@ -18,11 +19,11 @@ from robot_planning_interfaces.action import FindNextPoint
 from robot_planning_interfaces.action import Kromek
 from robot_planning_interfaces.srv import UpdateModel
 
-
+import threading
 from geometry_msgs.msg import Vector3Stamped
 import math
 
-class ScanningBehavior(rclpy.node.Node):
+class ScanningBehavior(Node):
     def __init__(self):
         super().__init__("scanning_behavior")
         # Parameters
@@ -34,20 +35,24 @@ class ScanningBehavior(rclpy.node.Node):
 
         # Subscriber, action clients, and service clients
         self.force_sub = self.create_subscription(Vector3Stamped, "/status/end_effector_force", self.force_callback, 1)
-        self.find_next_point_client = ActionClient(self, FindNextPoint, 'find_next_point')
-        self.kromek_client = ActionClient(self, Kromek, 'kromek_client')
-        self.update_model_client = self.create_client(UpdateModel, "update_model_client")
+        self.find_next_point_client = ActionClient(self, FindNextPoint, 'find_next_point_server')
+        self.kromek_client = ActionClient(self, Kromek, 'kromek')
+        self.update_model_client = self.create_client(UpdateModel, "update_model_server")
 
         self.spot_node_ = ros_scope.node()
         if self.spot_node_ is None:
                 raise ValueError("no ROS 2 node available (did you use bdai_ros2_wrapper.process.main?)")
+        
+        # Ensure the action servers are available
+        while not self.find_next_point_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().info('Waiting for FindNextPoint action server...')
+        while not self.kromek_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().info('Waiting for Kromek action server...')
 
         #Initialize some important member variables
         self.force = Vector3Stamped()
         self.fb_time = self.get_clock().now()
         self.fail_count = 0
-
-        #self.timer = self.create_timer(1.0, self.timer_callback)
 
         #Set up some robot thigns
         self.robot = SimpleSpotCommander(node=self.spot_node_)
@@ -56,23 +61,27 @@ class ScanningBehavior(rclpy.node.Node):
         self.begin()
 
     def begin(self):
-         n = self.get_parameter('num_samples').get_parameter_value().double_value
+         n = self.get_parameter('num_samples').get_parameter_value().integer_value
+         self.get_logger().info(f'Number of samples: {n}')
          find_next_pt_goal = FindNextPoint.Goal()
-         for i in n: #Sample iteratively requested number of points
+         for i in range(n): #Sample iteratively requested number of points
              # Use find point action client to obtain next point to sample
              find_next_pt_goal.fail_count = self.fail_count
              self.find_next_point_client.wait_for_server()
              send_goal_future = self.find_next_point_client.send_goal_async(find_next_pt_goal)
              rclpy.spin_until_future_complete(self, send_goal_future)
              goal_handle = send_goal_future.result()
+
              if not goal_handle.accepted:
                   self.get_logger().info('Goal rejected :o')
                   self.find_next_point_client.destroy()
                   break
-             self.get_logger('Goal accepted')
+             
+             self.get_logger().info('Goal accepted')
              get_result_future = goal_handle.get_result_async()
              rclpy.spin_until_future_complete(self, get_result_future)
-             point = get_result_future.result().point
+
+             point = get_result_future.result().result.point
              status = get_result_future.result().status
              if status == GoalStatus.STATUS_SUCCEEDED:
                   self.get_logger().info('Goal succeeded!')
@@ -81,12 +90,10 @@ class ScanningBehavior(rclpy.node.Node):
                   self.get_logger().info('Goal failed with status code: {0}'.format(status))
                   self.find_next_point_client.destroy()
                   self.destroy_node()
-                  rclpy.shutdown()
                   return
          self.find_next_point_client.destroy()
          self.destroy_node()
-         rclpy.shutdown()
-         return   
+         return
 
     def force_callback(self, force_msg):
          self.force = force_msg
@@ -102,6 +109,7 @@ class ScanningBehavior(rclpy.node.Node):
     def move_to_goal(self, point):
         if not self.claim_robot():
             return False
+        self.get_logger().info("move_to_goal!")
         tf_listener = TFListenerWrapper(self.spot_node_)
         tf_listener.wait_for_a_tform_b(ODOM_FRAME_NAME, "odom")
         action_goal = self.construct_pose_command(point, tf_listener)
@@ -114,6 +122,7 @@ class ScanningBehavior(rclpy.node.Node):
         max_force = self.get_parameter('max_arm_force').get_parameter_value().double_value
 
         while (self.trajectory_status > 0.03):
+            self.get_logger().info(f'Trajectory status: {self.trajectory_status}')
             if (self.vec_mag > max_force and (self.fb_time.nanoseconds - fb_start_time.nanoseconds) > 2e+9):
                 print(self.vec_mag)
                 self.get_logger().info("Max force exceeded, stowing arm and dropping current point")
@@ -130,7 +139,7 @@ class ScanningBehavior(rclpy.node.Node):
         #Update model
         update_model_req = UpdateModel.Request()
         update_model_req.x = point
-        update_model_req.y = y
+        update_model_req.y = float(y)
         while not self.update_model_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('service not available, waiting again...')
         future = self.update_model_client.call_async(update_model_req)
@@ -155,6 +164,7 @@ class ScanningBehavior(rclpy.node.Node):
             self.get_logger().error("Unable to claim robot message was " + result.message)
             return False
         self.get_logger().info("Claimed robot")
+        return True
 
     def construct_pose_command(self, point, tf_listener):
         #Get tranform for arm
@@ -212,7 +222,7 @@ class ScanningBehavior(rclpy.node.Node):
     
     def take_measurement(self):
         # Action call to kromek_ros' action server
-        time = self.get_parameter('measurement_time').get_parameter_value().double_value
+        time = self.get_parameter('measurement_time').get_parameter_value().integer_value
         kromek_pt_goal = Kromek.Goal()
         kromek_pt_goal.time = time
         self.kromek_client.wait_for_server()
@@ -223,10 +233,10 @@ class ScanningBehavior(rclpy.node.Node):
             self.get_logger().info('Goal rejected :o')
             self.kromek_client.destroy()
             return
-        self.get_logger('Goal accepted')
+        self.get_logger().info('Goal accepted')
         get_result_future = goal_handle.get_result_async()
         rclpy.spin_until_future_complete(self, get_result_future)
-        counts_per_sec = get_result_future.result().count
+        counts_per_sec = get_result_future.result().result.count
         status = get_result_future.result().status
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info('Goal succeeded!')

@@ -242,7 +242,7 @@ class BayesianScanner(Node):
         # Make the arm pose RobotCommand
         # Build a position to move the arm to (in meters, relative to and expressed in the gravity aligned body frame).
         pose = Pose()
-        pose.position = Point(x = x_next[0], y = x_next[1], z = 0.2)
+        pose.position = Point(x = x_next[0], y = x_next[1], z = 0.1)
         pose.orientation = Quaternion(x = 0.0 , y = 0.707 , z = 0.0 , w = 0.707)
         x, y, z = pose.position.x, pose.position.y, pose.position.z
         hand_pos = geometry_pb2.Vec3(x=x, y=y, z=z)
