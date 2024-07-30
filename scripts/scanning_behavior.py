@@ -57,7 +57,7 @@ class ScanningBehavior(Node):
         #Set up some robot thigns
         self.robot = SimpleSpotCommander(node=self.spot_node_)
         self.robot_command_client = ActionClientWrapper(RobotCommand, "robot_command", self.spot_node_)
-
+       
         self.begin()
 
     def begin(self):
@@ -120,10 +120,10 @@ class ScanningBehavior(Node):
         self.trajectory_status = 100.0
         self.vec_mag = 0.0
         max_force = self.get_parameter('max_arm_force').get_parameter_value().double_value
-
         while (self.trajectory_status > 0.03):
-            self.get_logger().info(f'Trajectory status: {self.trajectory_status}')
-            if (self.vec_mag > max_force and (self.fb_time.nanoseconds - fb_start_time.nanoseconds) > 2e+9):
+            rclpy.spin_once(self, timeout_sec=0.1)
+            #self.get_logger().info(f'Current force: {self.vec_mag}')
+            if (self.vec_mag > max_force and (self.fb_time.nanoseconds - fb_start_time.nanoseconds) > 3e+9):
                 print(self.vec_mag)
                 self.get_logger().info("Max force exceeded, stowing arm and dropping current point")
                 self.stow_arm()
@@ -183,7 +183,7 @@ class ScanningBehavior(Node):
         pose = Pose()
         pose.position = point
         pose.orientation = Quaternion(x = 0.0 , y = 0.707 , z = 0.0 , w = 0.707)
-        x, y, z = pose.position.x, pose.position.y, pose.position.z
+        x, y, z = pose.position.x, pose.position.y, 0.1
         hand_pos = geometry_pb2.Vec3(x=x, y=y, z=z)
 
         # Rotation as a quaternion
