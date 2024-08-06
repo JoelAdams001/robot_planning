@@ -2,6 +2,7 @@
 
 import struct
 import numpy as np
+import pandas as pd
 import rclpy
 from rclpy.action import ActionServer
 from rclpy.node import Node
@@ -17,6 +18,7 @@ from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
 from scipy.optimize import minimize
 from scipy.stats import norm
 import math
+import os
 
 class BayesianOptimization(Node):
     def __init__(self):
@@ -54,6 +56,8 @@ class BayesianOptimization(Node):
         self.y_sample = np.empty((1,1))
         # self.gp.fit(self.X_sample, self.y_sample)
         self.y_max = 0
+
+        self.rad_map_df_data = []
 
     def find_next_point(self, goal_handle):
         self.get_logger().info("Finding next point to sample...")
@@ -120,6 +124,18 @@ class BayesianOptimization(Node):
         res.success = True
         return res
     
+    def rad_maps_to_csv(self):
+        #First export the sampled points
+        sampled_pts = [(x[0], x[1], y) for x, y in zip(self.X_sample, self.y_sample)]
+        df = pd.DataFrame(sampled_pts, columns=['x', 'y', 'radiation measurement'])
+        file_path = os.path.expanduser("~/sampled_pts.csv")
+        df.to_csv(file_path, index=False)
+
+        #Now export the full maps
+        rad_map_df = pd.DataFrame(self.rad_map_df_data, columns=['sample_number', 'x', 'y', 'z'])
+        file_path = os.path.expanduser("~/rad_maps.csv")
+        self.rad_map_df.to_csv(file_path, index=False)
+
     def publish_surrogate_model(self):
         x_bounds = self.bounds[0]
         y_bounds = self.bounds[1]
@@ -139,8 +155,10 @@ class BayesianOptimization(Node):
         Z_pred_norm = (Z_pred - Z_min) / (Z_max - Z_min)
 
         tuples = np.dstack((X, Y, Z_pred_norm)).reshape(-1,3)
+        self.rad_map_df_data.append([len(tuples), tuples])
         pc2 = self.create_pointcloud(tuples, self.frame_id)
-        self.gp_pub_.publish(pc2) 
+        self.gp_pub_.publish(pc2)
+        self.rad_maps_to_csv()
 
     def create_pointcloud(self, tuples, frame_id):
         # Construct a ROS2 PointCloud2 message using a numpy array of tuples

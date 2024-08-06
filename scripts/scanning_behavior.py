@@ -28,7 +28,7 @@ class ScanningBehavior(Node):
         super().__init__("scanning_behavior")
         # Parameters
         self.declare_parameter('frame_id', "map")
-        self.declare_parameter('max_arm_force', 30.0)
+        self.declare_parameter('max_arm_force', 25.0)
         self.declare_parameter('num_samples', 10)
         self.declare_parameter('measurement_time', 5)
         self.frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
@@ -209,7 +209,7 @@ class ScanningBehavior(Node):
             hand_T_odom.rot.y,
             hand_T_odom.rot.z,
             ODOM_FRAME_NAME,
-            seconds,
+            seconds
         )
 
         follow_arm_command = RobotCommandBuilder.follow_arm_command()
