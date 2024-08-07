@@ -29,7 +29,7 @@ class ScanningBehavior(Node):
         # Parameters
         self.declare_parameter('frame_id', "map")
         self.declare_parameter('max_arm_force', 25.0)
-        self.declare_parameter('num_samples', 10)
+        self.declare_parameter('num_samples', 22)
         self.declare_parameter('measurement_time', 5)
         self.frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
 
@@ -91,6 +91,7 @@ class ScanningBehavior(Node):
                   self.find_next_point_client.destroy()
                   self.destroy_node()
                   return
+         self.stow_arm()
          self.find_next_point_client.destroy()
          self.destroy_node()
          return
@@ -183,7 +184,7 @@ class ScanningBehavior(Node):
         pose = Pose()
         pose.position = point
         pose.orientation = Quaternion(x = 0.0 , y = 0.707 , z = 0.0 , w = 0.707)
-        x, y, z = pose.position.x, pose.position.y, 0.1
+        x, y, z = pose.position.x, pose.position.y, -0.05
         hand_pos = geometry_pb2.Vec3(x=x, y=y, z=z)
 
         # Rotation as a quaternion

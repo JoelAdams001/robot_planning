@@ -49,15 +49,14 @@ class BayesianOptimization(Node):
         kernel = C(1.0, (1e-4, 1e1)) * RBF([1.0, 1.0], (1e-4, 1e1))
         self.gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=10)
 
-        # Sample first point
+
         # Note here x_sample refers to the array of coords (x,y), y_sample is array of rad readings
-        self.X_sample = np.empty((1,2))
-        # rad_reading = 50
-        self.y_sample = np.empty((1,1))
-        # self.gp.fit(self.X_sample, self.y_sample)
+        self.X_sample = np.array([])
+        self.y_sample = np.array([])
         self.y_max = 0
 
         self.rad_map_df_data = []
+        self.new_sample = False
 
     def find_next_point(self, goal_handle):
         self.get_logger().info("Finding next point to sample...")
@@ -69,9 +68,6 @@ class BayesianOptimization(Node):
         def min_obj(X):
             """Minimization objective is the negative acquisition function"""
             return -self.probability_of_improvement(X.reshape(-1, dim), goal_handle.request.fail_count)
-        
-        # x = np.linspace(1.2, self.l+1.2, 100)
-        # y = np.linspace(-self.w, self.w, 200)
 
         mins = [b[0] for b in self.bounds]  # Minimum values for each dimension
         maxs = [b[1] for b in self.bounds]  # Maximum values for each dimension
@@ -90,11 +86,9 @@ class BayesianOptimization(Node):
     def probability_of_improvement(self, X, fail_count):
         # Calculate xi based on number of times consecutively the robot failed to reach its goal point
         if (fail_count >= 0 and fail_count <= 5):
-            xi = (1/5)*math.exp(0.5*fail_count)
+            xi = (1/5)*math.exp(0.5*fail_count) + 0.5
         else:
-            xi = 2.5
-        #print(self.fail_count)
-        #print("Current xi: ", str(xi))
+            xi = 3
         """Computes the PI at points X based on existing samples using a Gaussian process surrogate model."""
         mu, sigma = self.gp.predict(X, return_std=True)
         with np.errstate(divide='warn'):
@@ -110,10 +104,14 @@ class BayesianOptimization(Node):
             self.y_max = req.y
         # Update GP model
         x = np.array([req.x.x, req.x.y])
-        self.X_sample = np.vstack((self.X_sample, x))
+        if self.X_sample.size == 0:
+            self.X_sample = np.array([x])
+        else:
+            self.X_sample = np.vstack((self.X_sample, x))
         self.y_sample = np.append(self.y_sample, req.y)
         self.gp.fit(self.X_sample, self.y_sample)
         res.success = True
+        self.new_sample = True
         return res
     
     def publish_sample_pts(self, req, res):
@@ -134,13 +132,15 @@ class BayesianOptimization(Node):
         #Now export the full maps
         rad_map_df = pd.DataFrame(self.rad_map_df_data, columns=['sample_number', 'x', 'y', 'z'])
         file_path = os.path.expanduser("~/rad_maps.csv")
-        self.rad_map_df.to_csv(file_path, index=False)
+        rad_map_df.to_csv(file_path, index=False)
 
     def publish_surrogate_model(self):
+        if len(self.X_sample) == 0:
+            return
         x_bounds = self.bounds[0]
         y_bounds = self.bounds[1]
         x = np.linspace(x_bounds[0], x_bounds[1], 100)
-        y = np.linspace(y_bounds[0], y_bounds[1], 200)
+        y = np.linspace(y_bounds[0], y_bounds[1], 100)
         X, Y = np.meshgrid(x, y)
         X_flat = X.ravel()
         Y_flat = Y.ravel()
@@ -152,13 +152,22 @@ class BayesianOptimization(Node):
         #Normalize Z_pred aka radiation values to the range [0,1]
         Z_min = np.min(Z_pred)
         Z_max = np.max(Z_pred)
-        Z_pred_norm = (Z_pred - Z_min) / (Z_max - Z_min)
+        if Z_max == Z_min: # Make sure we don't divide by zero
+            Z_pred_norm = np.zeros_like(Z_pred)
+        else:
+            Z_pred_norm = (Z_pred - Z_min) / (Z_max - Z_min)
 
         tuples = np.dstack((X, Y, Z_pred_norm)).reshape(-1,3)
-        self.rad_map_df_data.append([len(tuples), tuples])
+
+        #Check if update_model has been called since last appending
+        if self.new_sample == True:
+            for tuple in tuples:
+                self.rad_map_df_data.append([len(self.X_sample), *tuple])
+            print(len(self.X_sample))
+            self.rad_maps_to_csv()
+            self.new_sample = False
         pc2 = self.create_pointcloud(tuples, self.frame_id)
         self.gp_pub_.publish(pc2)
-        self.rad_maps_to_csv()
 
     def create_pointcloud(self, tuples, frame_id):
         # Construct a ROS2 PointCloud2 message using a numpy array of tuples
